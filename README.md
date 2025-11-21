@@ -61,7 +61,7 @@ pip install aiohttp beautifulsoup4 tqdm
 2. Clone repository:
 git clone https://github.com/Varshith9030/Mega-finder.git
 
-cd Mega-finder
+3. cd Mega-finder
 
 ----------------------------------------------------
 USAGE

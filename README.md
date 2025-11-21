@@ -55,29 +55,47 @@ Single-File Tool
 INSTALLATION
 ----------------------------------------------------
 
-1. Install dependencies:
-pip install aiohttp beautifulsoup4 tqdm
+Install dependencies:
 
-2. Clone repository:
+```bash
+pip install aiohttp beautifulsoup4 tqdm
+```
+
+Clone repository:
+
+```bash
 git clone https://github.com/Varshith9030/Mega-finder.git
 
-3. cd Mega-finder
+cd Mega-finder
+```
 
 ----------------------------------------------------
 USAGE
 ----------------------------------------------------
 
 Basic scan:
+
+```bash
 python3 mega_finder.py -i targets.txt -o results
+```
 
 With external wordlist:
+
+```bash
 python3 mega_finder.py -i targets.txt -o results --wordlist mega_wordlist_1m.txt
+```
 
 Deeper scan:
+
+```bash
 python3 mega_finder.py -i targets.txt -o results --concurrency 60 --parallel-targets 4 --max-probes 200000
+```
 
 Fast/light scan:
+
+```bash
 python3 mega_finder.py -i targets.txt --max-probes 5000 --max-pages 50 --max-depth 1
+```
 
 ----------------------------------------------------
 OUTPUT STRUCTURE

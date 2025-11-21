@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
-mega_finder.py (patched single-file)
+mega_finder.py (patched single-file) — segmented delivery
 
-- All-in-one recon & exposure scanner (MEGA). Single-file.
-- Supports external wordlist (--wordlist path.txt)
-- Generates internal permutation-based wordlist (aggressiveness)
-- Merges both lists, dedups, and fuzzes targets
-- Domain-restricted crawling (HTML + JS)
-- GraphQL detection, .env detection, .git checks, backups, swagger, phpinfo, CORS checks, JS secret search, directory listing detection
-- Async with aiohttp and throttling
-- Saves per-target results in structured folders (summary.json, summary.csv, raw saved files)
+INSTRUCTIONS:
+- Collect segments 1..10 in order and concatenate into a single file named mega_finder.py
+- Or say "assemble" after I finish and I'll write the file for you and provide a download link.
 
-Requirements:
-    pip install aiohttp beautifulsoup4 tqdm
-
-Usage:
-    python3 mega_finder.py -i targets.txt -o results_dir --wordlist mega_wordlist_1m.txt --concurrency 40 --aggressiveness 3 --max-probes 200000
-
-Be conservative when scanning (start with low concurrency and low max-probes).
+Legal: Use only on targets you are authorized to test.
 """
 
+# ---------------- imports ----------------
 import argparse
 import asyncio
 import csv
@@ -190,10 +180,7 @@ def generate_internal_wordlist(aggressiveness: int = DEFAULT_AGGRESSIVENESS) -> 
         entries.add(re.sub(r"//+", "/", path))
 
     return sorted(entries)
-
-
 # ---------------- HTTP helper functions ----------------
-
 
 async def fetch_text(session: aiohttp.ClientSession, url: str, timeout=DEFAULT_TIMEOUT) -> Tuple[str, int, Dict[str, str]]:
     """
@@ -220,7 +207,6 @@ async def post_json(session: aiohttp.ClientSession, url: str, payload: dict, tim
 
 # ---------------- Crawler & JS parsing ----------------
 
-
 class Crawler:
     def __init__(self, session: aiohttp.ClientSession, root: str, max_pages: int = DEFAULT_MAX_PAGES, max_depth: int = DEFAULT_MAX_DEPTH):
         self.session = session
@@ -241,11 +227,13 @@ class Crawler:
                 cand = urljoin(base_url, m)
                 if same_domain(cand, self.root):
                     self.findings.add(cand)
+
         # keyword hints
         low = js_text.lower()
         for kw in JS_SECRET_KEYWORDS:
             if kw in low:
                 self.findings.add(base_url + " #contains:" + kw)
+
         # explicit .env references
         for m in re.findall(r'\.env[^\s"\'<>)]*', js_text, flags=re.IGNORECASE):
             cand = urljoin(base_url, m)
@@ -256,10 +244,13 @@ class Crawler:
         if url in self.visited:
             return
         self.visited.add(url)
+
         html, status, headers = await fetch_text(self.session, url)
         if not html:
             return
+
         soup = BeautifulSoup(html, "html.parser")
+
         # anchors
         for a in soup.find_all("a", href=True):
             href = a.get("href").strip()
@@ -269,7 +260,8 @@ class Crawler:
                 continue
             if same_domain(full, self.root) and depth + 1 <= self.max_depth:
                 await self.to_visit.put((full, depth + 1))
-        # scripts
+
+        # external JS files
         for s in soup.find_all("script", src=True):
             src = s.get("src").strip()
             try:
@@ -280,10 +272,12 @@ class Crawler:
                 self.findings.add(js_url)
                 js_text, st, hs = await fetch_text(self.session, js_url)
                 await self._parse_js(js_text, js_url)
-        # inline scripts
+
+        # inline JS
         for s in soup.find_all("script"):
             if s.string:
                 await self._parse_js(s.string, url)
+
         # raw .env patterns in HTML
         for m in re.findall(r'\/[A-Za-z0-9_\-\/\.]*\.env[^\s"\'<>]*', html, flags=re.IGNORECASE):
             cand = normalize_url(urljoin(url, m))
@@ -299,30 +293,37 @@ class Crawler:
             except Exception:
                 pass
             pages += 1
+
         return list(self.findings)
-
-
 # ---------------- Detection helpers ----------------
-
 
 def looks_like_env(text: str) -> bool:
     if not text:
         return False
+
+    # Private keys
     if PRIVATE_KEY_PFX in text or RSA_KEY_PFX in text:
         return True
+
+    # KEY=VALUE patterns
     if ENV_LINE_RE.search(text):
-        # require indicators or multiple key lines
         low = text.lower()
+        # Strong indicators
         if any(tok.lower() in low for tok in SECRET_INDICATORS):
             return True
+        # If we find multiple environment-pattern lines
         if len(re.findall(ENV_LINE_RE, text)) >= 3:
             return True
+
+    # JSON-like secrets
     if re.search(r'"(aws|access|secret|password|token|private|key)"\s*:', text, flags=re.IGNORECASE):
         return True
+
     return False
 
 
 async def is_graphql_endpoint(session: aiohttp.ClientSession, url: str) -> Tuple[bool, str]:
+    # Try a minimal introspection signal
     status, text, headers = await post_json(session, url, {"query": "{ __typename }"})
     if status in (200, 400) and text:
         l = text.lower()
@@ -332,24 +333,35 @@ async def is_graphql_endpoint(session: aiohttp.ClientSession, url: str) -> Tuple
 
 
 async def check_cors(session: aiohttp.ClientSession, url: str) -> Tuple[bool, Dict[str, str]]:
+    """
+    Detect Access-Control-Allow-Origin: * with credentials=true
+    """
     try:
         async with session.options(url, timeout=ClientTimeout(total=6)) as r:
             headers = {k.lower(): v for k, v in r.headers.items()}
             aco = headers.get("access-control-allow-origin", "")
             acc = headers.get("access-control-allow-credentials", "")
+
+            # worst misconfig
             if aco == "*" and acc == "true":
                 return True, headers
-            if aco and ("http://" in aco or "https://" in aco) and ("localhost" in aco or "127.0.0.1" in aco or "*" in aco):
-                return True, headers
+
+            # suspicious origins
+            if aco and ("http://" in aco or "https://" in aco):
+                if "localhost" in aco or "127.0.0.1" in aco or "*" in aco:
+                    return True, headers
+
             return False, headers
+
     except Exception:
         return False, {}
-
-
 # ---------------- Orchestration ----------------
 
-
 async def probe_url(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore, timeout: int = DEFAULT_TIMEOUT) -> Dict:
+    """
+    Perform a GET request on a candidate URL under semaphore control.
+    Returns dict: {url, status, text, headers}.
+    """
     async with sem:
         try:
             text, status, headers = await fetch_text(session, url, timeout=timeout)
@@ -358,14 +370,25 @@ async def probe_url(session: aiohttp.ClientSession, url: str, sem: asyncio.Semap
             return {"url": url, "status": None, "text": "", "headers": {}}
 
 
-async def probe_candidates(session: aiohttp.ClientSession, candidates: List[str], concurrency: int, per_target_delay: float, max_probes: int = 0) -> List[Dict]:
+async def probe_candidates(
+    session: aiohttp.ClientSession,
+    candidates: List[str],
+    concurrency: int,
+    per_target_delay: float,
+    max_probes: int = 0
+) -> List[Dict]:
+    """
+    Probes all given candidate URLs asynchronously with concurrency limit.
+    """
     sem = asyncio.Semaphore(concurrency)
     tasks = []
+
     if max_probes and len(candidates) > max_probes:
-        # sample or slice to not blow up
         candidates = candidates[:max_probes]
+
     for c in candidates:
         tasks.append(asyncio.create_task(probe_url(session, c, sem)))
+
     results = []
     for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Probing"):
         try:
@@ -373,33 +396,61 @@ async def probe_candidates(session: aiohttp.ClientSession, candidates: List[str]
             results.append(res)
         except Exception:
             pass
+
         if per_target_delay > 0:
             await asyncio.sleep(per_target_delay * random.random())
+
     return results
 
 
-async def scan_target(session: aiohttp.ClientSession, target: str, outdir: Path, concurrency: int, max_pages: int, max_depth: int, per_target_delay: float, max_probes: int, extra_wordlist: List[str], aggressiveness: int):
+async def scan_target(
+    session: aiohttp.ClientSession,
+    target: str,
+    outdir: Path,
+    concurrency: int,
+    max_pages: int,
+    max_depth: int,
+    per_target_delay: float,
+    max_probes: int,
+    extra_wordlist: List[str],
+    aggressiveness: int
+):
+    """
+    Full scan on one target domain:
+    - crawl HTML & JS
+    - gather candidate URLs
+    - merge internal + external wordlists
+    - async probe all candidates
+    - detect secrets, backup files, openapi, graphql, cors, git, logs, config leaks
+    - save findings into summary.json / summary.csv
+    """
+
     target = normalize_url(target)
     parsed = urlparse(target)
     domain = parsed.netloc.replace(":", "_")
+
     target_dir = outdir / domain
     target_dir.mkdir(parents=True, exist_ok=True)
     summary = {"target": target, "found": []}
 
-    # 1) crawler hints
+    # 1. CRAWLER HINTS
     crawler = Crawler(session, target, max_pages=max_pages, max_depth=max_depth)
     try:
         hints = await crawler.run()
     except Exception:
         hints = []
-    # core candidate set
+
     candidate_paths: Set[str] = set()
 
-    # include builtins
-    for p in COMMON_ENV_PATHS + COMMON_GIT_PATHS + COMMON_BACKUPS + COMMON_SWAGGER + COMMON_PHPINFO + COMMON_ADMIN_PANELS + COMMON_LOGS + COMMON_CONFIGS + COMMON_WORDPRESS_BACKUPS + GRAPHQL_COMMON + CI_PATHS + COMMON_DIR_LIST_CHECK:
+    # Built-in common paths
+    for p in (
+        COMMON_ENV_PATHS + COMMON_GIT_PATHS + COMMON_BACKUPS + COMMON_SWAGGER +
+        COMMON_PHPINFO + COMMON_ADMIN_PANELS + COMMON_LOGS + COMMON_CONFIGS +
+        COMMON_WORDPRESS_BACKUPS + GRAPHQL_COMMON + CI_PATHS + COMMON_DIR_LIST_CHECK
+    ):
         candidate_paths.add(urljoin(target, p))
 
-    # include hints (crawler)
+    # Crawler hints
     for h in hints:
         if isinstance(h, str):
             if h.startswith("http://") or h.startswith("https://"):
@@ -407,26 +458,24 @@ async def scan_target(session: aiohttp.ClientSession, target: str, outdir: Path,
             else:
                 candidate_paths.add(urljoin(target, h))
 
-    # include external wordlist items (full urls or relative)
+    # External wordlist (provided by user)
     for item in (extra_wordlist or []):
         if item.startswith("http://") or item.startswith("https://"):
             candidate_paths.add(item)
         else:
             candidate_paths.add(urljoin(target, item))
 
-    # include internal generated list scaled by aggressiveness
+    # Internal auto-generated permutations
     internal = generate_internal_wordlist(aggressiveness)
-    # sample internal list if we want to limit overall size later; but keep full now
     for p in internal:
         candidate_paths.add(urljoin(target, p))
 
-    # derived dirs from hints (parents)
+    # Derive parent directories from crawler-found URLs
     for h in hints:
         if isinstance(h, str) and h.startswith("http"):
             p = urlparse(h)
             base = f"{p.scheme}://{p.netloc}"
             path = p.path or "/"
-            # progressively add parents
             parts = [seg for seg in path.split("/") if seg]
             accum = "/"
             for i in range(len(parts)):
@@ -437,232 +486,497 @@ async def scan_target(session: aiohttp.ClientSession, target: str, outdir: Path,
     candidate_paths.add(urljoin(target, "/robots.txt"))
     candidate_paths.add(urljoin(target, "/sitemap.xml"))
 
-    # s3 like attempts
+    # Cloud bucket candidates
     hostname = parsed.netloc.split(":")[0]
     for suf in S3_CANDIDATES_SUFFIXES:
         candidate_paths.add("https://" + hostname + "." + suf)
         candidate_paths.add("http://" + hostname + "." + suf)
 
-    # normalize and filter domain-only (keep full URLs only and domain restricted)
+    # Normalize & filter by domain or bucket domains
     final_candidates = []
     for c in candidate_paths:
         try:
             full = normalize_url(c)
         except Exception:
             continue
-        # keep only same-domain HTTP/S URLs or explicit external (user provided)
-        # If the candidate is host-like (https://host.s3...), keep it
+
         try:
             parsed_c = urlparse(full)
             if not parsed_c.scheme:
                 continue
-            # include if same-domain or looks like bucket / explicit url
+
             if same_domain(full, target) or ("s3." in full or ".storage.googleapis.com" in full):
                 final_candidates.append(full)
         except Exception:
             continue
 
-    # deduplicate and shuffle
+    # Dedup + shuffle
     final_candidates = sorted(set(final_candidates))
     random.shuffle(final_candidates)
 
-    # limit total probes if requested
+    # Cut by max-probes if needed
     probes_to_run = final_candidates if (max_probes <= 0) else final_candidates[:max_probes]
 
-    # 2) probe candidates
-    probe_results = await probe_candidates(session, probes_to_run, concurrency, per_target_delay, max_probes)
+    # 2. PROBE CANDIDATES
+    probe_results = await probe_candidates(
+        session, probes_to_run, concurrency, per_target_delay, max_probes
+    )
 
     findings = []
-    # analyze probe results
+    # 3. DETECT LEAKS
     for r in probe_results:
-        url = r.get("url")
-        status = r.get("status")
-        text = (r.get("text") or "")
-        headers = r.get("headers") or {}
-        try:
-            ppath = urlparse(url).path or "/"
-        except Exception:
-            ppath = "/"
+        url = r["url"]
+        st = r["status"]
+        text = r["text"]
+        headers = r["headers"]
 
-        if status and 200 <= status < 300:
-            # .env detection
-            if looks_like_env(text):
-                fname = target_dir / (sane_filename(ppath.strip("/").replace("/", "_") or "root") + "_env.txt")
+        if st in (None, -1):
+            continue
+
+        # --- ENV / SECRET LEAKS ---
+        if st == 200 and text and looks_like_env(text):
+            fn = sane_filename(url) + "_env.txt"
+            outfile = target_dir / fn
+            try:
+                with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+            except Exception:
+                pass
+            findings.append(
+                {"type": "env_leak", "url": url, "saved": str(outfile.name), "status": st}
+            )
+
+        # --- GIT REPO EXPOSURE ---
+        if st == 200 and ".git" in url and ("HEAD" in url or "config" in url or "logs" in url):
+            fn = sane_filename(url) + "_git.txt"
+            outfile = target_dir / fn
+            try:
+                with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+            except Exception:
+                pass
+            findings.append(
+                {"type": "git_exposed", "url": url, "saved": outfile.name, "status": st}
+            )
+
+        # --- BACKUP / CONFIG / LOG leaks by filename heuristic ---
+        lname = url.lower()
+        if st == 200:
+            if any(ext in lname for ext in [".zip", ".tar", ".gz", ".sql", ".bak", ".old", ".backup"]):
+                fn = sane_filename(url) + "_backup"
+                outfile = target_dir / fn
                 try:
-                    with open(fname, "w", errors="ignore") as fh:
-                        fh.write(text)
+                    with open(outfile, "wb") as f:
+                        f.write(text.encode("utf-8", errors="ignore"))
                 except Exception:
                     pass
-                findings.append({"type": ".env", "url": url, "status": status, "file": str(fname)})
+                findings.append(
+                    {"type": "backup_file", "url": url, "saved": outfile.name, "status": st}
+                )
 
-            # git exposures
-            if "/.git" in url:
-                findings.append({"type": "git", "url": url, "status": status})
-
-            # backups
-            if any(url.lower().endswith(ext) for ext in [".zip", ".tar", ".tar.gz", ".bak", ".old", ".sql"]):
-                findings.append({"type": "backup", "url": url, "status": status})
-
-            # swagger/openapi
-            if "swagger" in url.lower() or "openapi" in url.lower() or "api-docs" in url.lower():
-                if "swagger" in text.lower() or "openapi" in text.lower() or '"openapi":' in text.lower():
-                    fname = target_dir / (sane_filename(ppath.strip("/") or "openapi") + ".json")
-                    try:
-                        with open(fname, "w", errors="ignore") as fh:
-                            fh.write(text)
-                    except Exception:
-                        pass
-                    findings.append({"type": "openapi", "url": url, "status": status, "file": str(fname)})
-
-            # phpinfo
-            if "phpinfo" in url.lower() or "phpinfo" in text.lower() or "php.ini" in text.lower():
-                findings.append({"type": "phpinfo", "url": url, "status": status})
-
-            # directory listing
-            if "<title>index of" in text.lower() or re.search(r"(?i)parent directory</a>", text):
-                findings.append({"type": "directory-listing", "url": url, "status": status})
-
-            # logs/configs
-            if any(kw in url.lower() for kw in ["log", "error", "debug", "config", "settings", "credentials"]) or any(kw.lower() in text.lower() for kw in ["password", "secret", "aws", "mongodb", "db_password"]):
-                findings.append({"type": "possible-secret-or-config", "url": url, "status": status})
-
-            # GraphQL detection (fast test)
-            if any(g in url.lower() for g in ["graphql", "/graphiql", "/playground", "/gql"]):
-                ok, raw = await is_graphql_endpoint(session, url)
-                if ok:
-                    findings.append({"type": "graphql", "url": url, "status": status})
-
-            # CORS check
-            cors_vuln, cors_headers = await check_cors(session, url)
-            if cors_vuln:
-                findings.append({"type": "cors", "url": url, "status": status, "headers": cors_headers})
-
-    # 3) JS deep-scan: fetch discovered JS (from hints) and search for secret keywords and .env references
-    js_candidates = [c for c in final_candidates if c.lower().endswith(".js")]
-    if js_candidates:
-        # smaller concurrency for JS
-        js_results = await probe_candidates(session, js_candidates, max(2, concurrency // 2), per_target_delay, max_probes=2000)
-        for jr in js_results:
-            jtext = jr.get("text") or ""
-            jurl = jr.get("url")
-            low = jtext.lower()
-            for kw in JS_SECRET_KEYWORDS:
-                if kw in low:
-                    findings.append({"type": "js-secret-hint", "url": jurl, "keyword": kw})
-            for m in re.findall(r'\/[A-Za-z0-9_\-\/\.]*\.env[^\s"\'<>]*', jtext, flags=re.IGNORECASE):
-                full = normalize_url(urljoin(jurl, m))
-                findings.append({"type": ".env-hint-in-js", "url": full})
-
-    # 4) robots & sitemap hints
-    try:
-        robots_text, st, _ = await fetch_text(session, urljoin(target, "/robots.txt"))
-        if robots_text and st and st < 400:
-            for line in robots_text.splitlines():
-                if line.strip().lower().startswith("disallow") or ".env" in line.lower() or "backup" in line.lower():
-                    findings.append({"type": "robots-hint", "url": urljoin(target, "/robots.txt"), "line": line.strip()})
-    except Exception:
-        pass
-
-    # save per-target summary
-    summary_path = target_dir / "summary.json"
-    try:
-        with open(summary_path, "w", encoding="utf-8") as sf:
-            json.dump({"target": target, "found": findings}, sf, indent=2)
-    except Exception:
-        pass
-
-    csv_path = target_dir / "summary.csv"
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as cf:
-            writer = csv.writer(cf)
-            writer.writerow(["type", "url", "status", "extra"])
-            for f in findings:
-                extra = {k: v for k, v in f.items() if k not in ("type", "url", "status")}
-                writer.writerow([f.get("type"), f.get("url"), f.get("status"), json.dumps(extra)])
-    except Exception:
-        pass
-
-    return findings
-
-
-async def run_targets(targets: List[str], outdir: Path, concurrency: int, max_pages: int, max_depth: int, per_target_delay: float, parallel_targets: int, max_probes: int, wordlist_path: str, aggressiveness: int):
-    # load external wordlist if provided
-    external = load_wordlist(wordlist_path) if wordlist_path else []
-    # create aiohttp session per worker
-    results = {}
-    sem = asyncio.Semaphore(parallel_targets)
-
-    async def worker(t):
-        async with sem:
-            timeout = ClientTimeout(total=None)
-            connector = aiohttp.TCPConnector(limit_per_host=DEFAULT_CONCURRENCY_PER_HOST, ssl=False)
-            headers = DEFAULT_HEADERS.copy()
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        # --- LOG leaks ---
+        if st == 200 and ("log" in lname or lname.endswith(".log")):
+            if len(text) > 30:
+                fn = sane_filename(url) + "_log.txt"
+                outfile = target_dir / fn
                 try:
-                    res = await scan_target(session, t, outdir, concurrency, max_pages, max_depth, per_target_delay, max_probes, external, aggressiveness)
-                    results[t] = res
+                    with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                        f.write(text)
+                except Exception:
+                    pass
+                findings.append(
+                    {"type": "log_leak", "url": url, "saved": outfile.name, "status": st}
+                )
+
+        # --- SWAGGER / OPENAPI ---
+        if st == 200 and (
+            "swagger" in lname or lname.endswith("swagger.json") or lname.endswith("openapi.json") or lname.endswith("openapi.yaml")
+        ):
+            fn = sane_filename(url) + "_api.json"
+            outfile = target_dir / fn
+            try:
+                with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+            except Exception:
+                pass
+            findings.append(
+                {"type": "openapi", "url": url, "saved": outfile.name, "status": st}
+            )
+
+        # --- PHPINFO ---
+        if st == 200 and ("phpinfo" in lname or "php info" in text.lower()):
+            fn = sane_filename(url) + "_phpinfo.html"
+            outfile = target_dir / fn
+            try:
+                with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+            except Exception:
+                pass
+            findings.append(
+                {"type": "phpinfo", "url": url, "saved": outfile.name, "status": st}
+            )
+
+        # --- Directory Listing ---
+        if st == 200 and "Index of" in text:
+            findings.append({"type": "dir_listing", "url": url, "status": st})
+
+        # --- CORS Misconfig ---
+        is_cors, cors_headers = await check_cors(session, url)
+        if is_cors:
+            findings.append(
+                {"type": "cors_misconfig", "url": url, "details": cors_headers}
+            )
+
+        # --- GRAPHQL ---
+        if st in (200, 400) and "graphql" in lname:
+            is_gql, gql_text = await is_graphql_endpoint(session, url)
+            if is_gql:
+                fn = sane_filename(url) + "_graphql.txt"
+                outfile = target_dir / fn
+                try:
+                    with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+                        f.write(gql_text)
+                except Exception:
+                    pass
+
+                findings.append(
+                    {"type": "graphql", "url": url, "saved": outfile.name, "status": st}
+                )
+
+    # Final summary
+    summary["found"] = findings
+
+    # Save summary.json
+    sumfile = target_dir / "summary.json"
+    with open(sumfile, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    # Save summary.csv
+    csvfile = target_dir / "summary.csv"
+    with open(csvfile, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["type", "url", "saved", "status"])
+        for row in findings:
+            w.writerow([
+                row.get("type"),
+                row.get("url"),
+                row.get("saved", ""),
+                row.get("status", "")
+            ])
+
+    return summary
+# ---------------- Global multi-target scan ----------------
+
+async def scan_all(
+    targets: List[str],
+    output_dir: Path,
+    concurrency: int,
+    per_target_delay: float,
+    max_pages: int,
+    max_depth: int,
+    max_probes: int,
+    wordlist: List[str],
+    aggressiveness: int
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        sem = asyncio.Semaphore( min(concurrency, len(targets)) )
+
+        async def _one(tg):
+            async with sem:
+                try:
+                    return await scan_target(
+                        session, tg, output_dir, concurrency,
+                        max_pages, max_depth,
+                        per_target_delay,
+                        max_probes,
+                        wordlist,
+                        aggressiveness
+                    )
                 except Exception as e:
-                    results[t] = {"error": str(e)}
-            await asyncio.sleep(0.05)
+                    return {"target": tg, "error": str(e), "found": []}
 
-    tasks = [asyncio.create_task(worker(t)) for t in targets]
-    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Targets"):
-        try:
-            await f
-        except Exception:
-            pass
+        tasks = [asyncio.create_task(_one(t)) for t in targets]
 
-    # global summary
-    try:
-        with open(outdir / "global_summary.json", "w", encoding="utf-8") as gf:
-            json.dump(results, gf, indent=2)
-    except Exception:
-        pass
+        results = []
+        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Targets"):
+            try:
+                r = await f
+                results.append(r)
+            except Exception:
+                pass
+
+    # Save global summary
+    gsum = output_dir / "global_summary.json"
+    with open(gsum, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    elapsed = time.time() - t0
+    print(f"\nCompleted scanning {len(targets)} targets in {elapsed:.1f}s")
+    print(f"Global summary saved to: {gsum}")
+
     return results
 
 
-# ---------------- CLI & main ----------------
-
+# ---------------- Argument parser ----------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="MEGA-Finder (patched single-file) - Use only on authorized targets")
-    p.add_argument("-i", "--input", required=True, help="File with target base URLs (one per line)")
-    p.add_argument("-o", "--output", default="mega_results", help="Output directory")
+    p = argparse.ArgumentParser(description="Mega Finder - All-in-one recon scanner")
+    p.add_argument("-i", "--input", required=True, help="File containing target URLs/domains")
+    p.add_argument("-o", "--output", required=True, help="Output directory")
+    p.add_argument("--wordlist", help="Optional extra wordlist file")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Concurrent HTTP probes")
-    p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Max pages to crawl per target")
-    p.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH, help="Crawl depth per target")
-    p.add_argument("--per-target-delay", type=float, default=DEFAULT_PER_TARGET_DELAY, help="Jitter delay between probes")
-    p.add_argument("--parallel-targets", type=int, default=2, help="How many targets to scan in parallel")
-    p.add_argument("--max-probes", type=int, default=0, help="Limit candidate probes per target (0 = unlimited)")
-    p.add_argument("--wordlist", help="Optional external wordlist file (one path per line or full URLs)")
-    p.add_argument("--aggressiveness", type=int, default=DEFAULT_AGGRESSIVENESS, help="1..5 internal generation aggressiveness")
-    return p.parse_args()
+    p.add_argument("--parallel-targets", type=int, default=5, help="Number of targets to scan in parallel")
+    p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Max crawler pages per target")
+    p.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH, help="Crawler depth limit")
+    p.add_argument("--per-target-delay", type=float, default=DEFAULT_PER_TARGET_DELAY, help="Random delay between probes per target")
+    p.add_argument("--max-probes", type=int, default=0, help="Limit number of URLs probed per target (0 = unlimited)")
+    p.add_argument("--aggressiveness", type=int, default=DEFAULT_AGGRESSIVENESS, help="1..5 internal wordlist strength")
+    return p
 
 
-def load_targets(path: str) -> List[str]:
-    t = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            s = line.strip()
-            if s:
-                t.append(normalize_url(s))
-    return t
+# ---------------- Entry point + MF Banner ----------------
+
+def print_mf_banner():
+    print(r"""
+ __  __ _____ 
+|  \/  |  ___|
+| |\/| | |_  
+| |  | |  _| 
+|_|  |_|_|   
+
+   M F
+MEGA FINDER
+""")
 
 
 def main():
-    args = parse_args()
-    targets = load_targets(args.input)
-    outdir = Path(args.output)
-    outdir.mkdir(parents=True, exist_ok=True)
-    print(f"[+] Targets: {len(targets)} — output: {outdir.resolve()}")
-    start = time.time()
+    print_mf_banner()
+
+    args = parse_args().parse_args() if hasattr(parse_args, "parse_args") else parse_args().parse_args()
+    # This is a workaround for argparse in inline packaging.
+
+
+    # Load targets
     try:
-        asyncio.run(run_targets(targets, outdir, args.concurrency, args.max_pages, args.max_depth, args.per_target_delay, args.parallel_targets, args.max_probes, args.wordlist, args.aggressiveness))
-    except KeyboardInterrupt:
-        print("[!] Interrupted by user")
-    elapsed = time.time() - start
-    print(f"[+] Completed in {elapsed:.1f}s — results in {outdir.resolve()}")
+        with open(args.input, "r", encoding="utf-8") as f:
+            targets = [normalize_url(x.strip()) for x in f if x.strip()]
+    except Exception:
+        print("ERROR: Could not read input file.")
+        return
+
+    # Load wordlist
+    extra_list = load_wordlist(args.wordlist) if args.wordlist else []
+
+    print(f"[+] Loaded {len(targets)} targets")
+    if args.wordlist:
+        print(f"[+] Loaded external wordlist: {len(extra_list)} entries")
+    print("[+] Starting scan...\n")
+
+    outdir = Path(args.output)
+
+    asyncio.run(
+        scan_all(
+            targets,
+            outdir,
+            concurrency=args.parallel_targets,
+            per_target_delay=args.per_target_delay,
+            max_pages=args.max_pages,
+            max_depth=args.max_depth,
+            max_probes=args.max_probes,
+            wordlist=extra_list,
+            aggressiveness=args.aggressiveness
+        )
+    )
 
 
 if __name__ == "__main__":
     main()
+# ---------------- Additional helpers & safety patches ----------------
+
+def safe_join(base: str, path: str) -> str:
+    """
+    urljoin wrapper that avoids double slashes and ensures safe normalization.
+    """
+    try:
+        full = urljoin(base, path)
+        full = re.sub(r"//+", "/", full.replace(":/", "://"))
+        return full
+    except Exception:
+        return path
+
+
+def dedupe_preserve_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def sanitize_candidates(candidates: List[str]) -> List[str]:
+    """
+    Remove malformed or duplicate URLs.
+    """
+    out = []
+    for c in candidates:
+        try:
+            parsed = urlparse(c)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            out.append(c)
+        except Exception:
+            continue
+    return dedupe_preserve_order(out)
+
+
+def looks_like_bucket(url: str) -> bool:
+    """
+    Simple check for S3/GCS bucket candidates.
+    """
+    u = url.lower()
+    return (
+        "s3.amazonaws.com" in u
+        or ".s3." in u
+        or "storage.googleapis.com" in u
+        or u.endswith(".s3.amazonaws.com")
+    )
+# ---------------- Extended S3 / GCS bucket testing ----------------
+
+async def check_bucket_listable(session: aiohttp.ClientSession, url: str) -> Tuple[bool, str]:
+    """
+    Basic bucket listing indicator:
+    - XML listing
+    - 'AccessDenied' vs 'ListBucketResult'
+    """
+    try:
+        text, status, headers = await fetch_text(session, url, timeout=8)
+        if not text:
+            return False, ""
+
+        low = text.lower()
+
+        # AWS XML listing
+        if "<listbucketresult" in low:
+            return True, "public-listing"
+
+        # Google Storage listing
+        if "<listbuckets" in low or "<prefix>" in low:
+            return True, "public-listing"
+
+        # Access Denied but bucket exists
+        if "accessdenied" in low or "allaccessdisabled" in low:
+            return True, "exists-denied"
+
+        # If JSON error with bucket info
+        if "bucket" in low and ("notfound" in low or "forbidden" in low):
+            return True, "exists"
+
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+# ---------------- robots.txt & sitemap.xml extraction ----------------
+
+def extract_from_robots(text: str, root: str) -> List[str]:
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("allow:") or line.lower().startswith("disallow:"):
+            try:
+                part = line.split(":", 1)[1].strip()
+                if part.startswith("/"):
+                    out.append(urljoin(root, part))
+            except Exception:
+                continue
+    return out
+
+
+def extract_from_sitemap(text: str) -> List[str]:
+    """
+    Extract <loc> URLs from sitemap XML.
+    """
+    urls = re.findall(r"<loc>(.*?)</loc>", text, flags=re.IGNORECASE)
+    out = []
+    for u in urls:
+        u = u.strip()
+        if u.startswith("http://") or u.startswith("https://"):
+            out.append(u)
+    return out
+# ---------------- Integrate robots.txt & sitemap.xml into candidate lists ----------------
+
+async def integrate_robot_sitemap(session: aiohttp.ClientSession, base: str) -> List[str]:
+    """
+    Fetches /robots.txt and /sitemap.xml and extracts URLs.
+    This function is optional — some sites block these requests.
+    """
+    collected = []
+    robots_url = urljoin(base, "/robots.txt")
+    sitemap_url = urljoin(base, "/sitemap.xml")
+
+    # robots.txt
+    try:
+        text, st, hdr = await fetch_text(session, robots_url, timeout=6)
+        if st == 200 and text:
+            extracted = extract_from_robots(text, base)
+            collected.extend(extracted)
+    except Exception:
+        pass
+
+    # sitemap.xml
+    try:
+        text, st, hdr = await fetch_text(session, sitemap_url, timeout=6)
+        if st == 200 and text:
+            extracted = extract_from_sitemap(text)
+            collected.extend(extracted)
+    except Exception:
+        pass
+
+    return collected
+
+
+# ---------------- Deduplicate & sanitize ----------------
+
+def normalize_final_candidates(base: str, candidates: List[str]) -> List[str]:
+    """
+    Normalize URLs, enforce domain-matching rules, and filter malformed entries.
+    """
+    out = []
+    for c in candidates:
+        try:
+            full = normalize_url(c)
+        except Exception:
+            continue
+
+        parsed = urlparse(full)
+        if not parsed.scheme or not parsed.netloc:
+            continue
+
+        # allow domain or S3/GCS bucket
+        if same_domain(base, full) or looks_like_bucket(full):
+            out.append(full)
+
+    return dedupe_preserve_order(out)
+# ---------------- Final URL utilities & cleanup ----------------
+
+def ensure_slash_prefix(p: str) -> str:
+    if not p.startswith("/"):
+        return "/" + p
+    return p
+
+
+def unique_paths(paths: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
